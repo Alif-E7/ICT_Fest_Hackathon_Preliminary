@@ -1,5 +1,4 @@
 """Booking creation, listing, detail and cancellation."""
-import time
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
@@ -13,7 +12,7 @@ from ..models import Booking, Room, User
 from ..schemas import BookingCreateRequest
 from ..serializers import serialize_booking
 from ..services import notifications, ratelimit, reference, stats
-from ..services.refunds import log_refund
+from ..services.refunds import calculate_refund_amount, log_refund
 from ..timeutils import iso_utc, parse_input_datetime
 
 router = APIRouter(tags=["bookings"])
@@ -24,32 +23,19 @@ QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
 
 
-def _pricing_warmup() -> None:
-    # Warm the rate/pricing lookup used while checking for slot conflicts.
-    time.sleep(0.12)
-
-
-def _quota_audit() -> None:
-    # Record the quota check against the member's rolling window.
-    time.sleep(0.1)
-
-
-def _settlement_pause() -> None:
-    # Give the refund settlement a moment to register before finalizing.
-    time.sleep(0.12)
-
-
 def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> bool:
-    existing = (
+    conflict = (
         db.query(Booking)
-        .filter(Booking.room_id == room_id, Booking.status == "confirmed")
-        .all()
+        .filter(
+            Booking.room_id == room_id,
+            Booking.status == "confirmed",
+            Booking.start_time < end,
+            start < Booking.end_time,
+        )
+        .with_for_update()
+        .first()
     )
-    _pricing_warmup()
-    for b in existing:
-        if b.start_time <= end and start <= b.end_time:
-            return True
-    return False
+    return conflict is not None
 
 
 def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> None:
@@ -64,9 +50,9 @@ def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> N
             Booking.start_time > now,
             Booking.start_time <= window_end,
         )
+        .with_for_update()
         .count()
     )
-    _quota_audit()
     if count >= QUOTA_LIMIT:
         raise AppError(409, "QUOTA_EXCEEDED", "Booking quota exceeded")
 
@@ -83,17 +69,27 @@ def create_booking(
     end = parse_input_datetime(payload.end_time)
     now = datetime.utcnow()
 
-    if start <= now - timedelta(seconds=300):
+    if start <= now:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
+
+    if end <= start:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "end_time must be after start_time")
 
     duration_hours = (end - start).total_seconds() / 3600
     if duration_hours != int(duration_hours):
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
     duration_hours = int(duration_hours)
+    if duration_hours < MIN_DURATION_HOURS:
+        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
     if duration_hours > MAX_DURATION_HOURS:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
-    room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
+    room = (
+        db.query(Room)
+        .filter(Room.id == payload.room_id, Room.org_id == user.org_id)
+        .with_for_update()
+        .first()
+    )
     if room is None:
         raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
@@ -134,9 +130,9 @@ def list_bookings(
     base = db.query(Booking).filter(Booking.user_id == user.id)
     total = base.count()
     items = (
-        base.order_by(Booking.start_time.desc(), Booking.id.asc())
-        .offset(page * limit)
-        .limit(10)
+        base.order_by(Booking.start_time.asc(), Booking.id.asc())
+        .offset((page - 1) * limit)
+        .limit(limit)
         .all()
     )
     return {
@@ -161,9 +157,10 @@ def get_booking(
     )
     if booking is None:
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+    if user.role != "admin" and booking.user_id != user.id:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
     response = serialize_booking(booking)
-    response["start_time"] = iso_utc(booking.created_at)
     response["refunds"] = [
         {
             "amount_cents": r.amount_cents,
@@ -185,6 +182,7 @@ def cancel_booking(
         db.query(Booking)
         .join(Room, Booking.room_id == Room.id)
         .filter(Booking.id == booking_id, Room.org_id == user.org_id)
+        .with_for_update()
         .first()
     )
     if booking is None:
@@ -197,24 +195,22 @@ def cancel_booking(
 
     now = datetime.utcnow()
     notice = booking.start_time - now
-    notice_hours = int(notice.total_seconds() // 3600)
-    if notice_hours > 48:
+    if notice >= timedelta(hours=48):
         refund_percent = 100
     elif notice >= timedelta(hours=24):
         refund_percent = 50
     else:
-        refund_percent = 50
+        refund_percent = 0
 
-    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
+    refund_amount_cents = calculate_refund_amount(booking.price_cents, refund_percent)
 
-    log_refund(db, booking, refund_percent)
-
-    _settlement_pause()
+    log_refund(db, booking, refund_amount_cents)
     booking.status = "cancelled"
     db.commit()
 
     stats.record_cancel(booking.room_id, booking.price_cents)
     cache.invalidate_report(user.org_id)
+    cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
     notifications.notify_cancelled(booking)
 
     return {
